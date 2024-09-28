@@ -4,7 +4,12 @@
 #include "sensor_msgs/msg/laser_scan.hpp"
 #include "tf2_ros/transform_broadcaster.h"
 #include <cmath>
+#include <geometry_msgs/msg/twist.hpp>
 #include <iomanip> // for formatting
+#include <nav_msgs/msg/odometry.hpp>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 #include <unordered_map>
 
 using GoToLoading = custom_interfaces::srv::GoToLoading;
@@ -32,6 +37,14 @@ public:
     // Log the creation of the scan subscriber
     RCLCPP_INFO(this->get_logger(), "Subscriber for /scan topic created.");
 
+    // Odometry subscriber for robot movement control (initially inactive)
+    odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+        "/odom", 10,
+        std::bind(&ApproachService::odom_callback, this,
+                  std::placeholders::_1));
+    // Log the creation of the odom subscriber
+    RCLCPP_INFO(this->get_logger(), "Subscriber for /odom topic created.");
+
     // Set up the transform broadcaster
     tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
     RCLCPP_INFO(this->get_logger(), "Transform broadcaster initialized.");
@@ -43,11 +56,19 @@ public:
 
     // Timer to continuously publish the cart_frame transform
     cart_transform_timer_ = this->create_wall_timer(
-        std::chrono::milliseconds(100), // Adjust the frequency as needed
+        std::chrono::milliseconds(50), // Adjust the frequency as needed
         std::bind(&ApproachService::publish_cart_transform, this));
 
     // Initially, stop the timer until the service is called
     cart_transform_timer_->cancel();
+
+    // Create a publisher for sending velocity commands
+    velocity_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(
+        "/diffbot_base_controller/cmd_vel_unstamped", 10);
+
+    // Initialize tf2 buffer and listener
+    tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
     RCLCPP_INFO(this->get_logger(), "Approach Service Server created.");
   }
@@ -66,10 +87,7 @@ private:
             "Legs detected, proceeding to publish transform and move robot.");
         // Start publishing the cart transform periodically
         cart_transform_timer_->reset();
-        move_robot_to_cart();
-        // Stop publishing the transform once the robot reaches the cart
-        // cart_transform_timer_->cancel();
-        lift_shelf();
+        // lift_shelf();
         response->complete = true;
         RCLCPP_INFO(this->get_logger(),
                     "Final approach successful. Response set to True.");
@@ -291,16 +309,70 @@ private:
     tf_broadcaster_->sendTransform(transformStamped);
 
     RCLCPP_INFO(this->get_logger(), "Published cart_frame transform.");
-    RCLCPP_INFO(this->get_logger(), "Publishing cart_frame transform... X: %f, Y: %f", midpoint_distance_ * cos(midpoint_angle_), midpoint_distance_ * sin(midpoint_angle_));
+    RCLCPP_INFO(this->get_logger(),
+                "Publishing cart_frame transform... X: %f, Y: %f",
+                midpoint_distance_ * cos(midpoint_angle_),
+                midpoint_distance_ * sin(midpoint_angle_));
 
+    cart_published_ = true; // Set flag to true when cart_frame is published
   }
 
-  void move_robot_to_cart() {
-    // Code to move the robot towards the cart_frame based on the published
-    // transform
-    RCLCPP_INFO(this->get_logger(), "Moving robot to cart_frame...");
-    // Add actual movement logic here
-    // Move the robot forward 30 cm more
+  void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+    if (!cart_published_) {
+      // If cart_frame hasn't been published, skip odom processing
+      return;
+    }
+
+    // Move the robot towards the cart_frame using odom data
+    geometry_msgs::msg::TransformStamped transformStamped;
+
+    try {
+      // Get the transform from the robot base_link to cart_frame
+      transformStamped = tf_buffer_->lookupTransform(
+          "robot_base_link", "cart_frame", tf2::TimePointZero,
+          tf2::durationFromSec(0.2));
+    } catch (tf2::TransformException &ex) {
+      RCLCPP_WARN(this->get_logger(), "Could not transform: %s", ex.what());
+      return;
+    }
+
+    // Calculate the distance and angle to cart_frame
+    double dx = transformStamped.transform.translation.x;
+    double dy = transformStamped.transform.translation.y;
+    double distance = sqrt(dx * dx + dy * dy);
+    double angle_to_goal = atan2(dy, dx);
+
+    RCLCPP_INFO(this->get_logger(), "Distance to cart: %f, Angle to cart: %f",
+                distance, angle_to_goal);
+
+    // Stop if the robot is close enough to the cart_frame
+    if (distance < 0.05) {
+      stop_robot();
+      RCLCPP_INFO(this->get_logger(),
+                  "Reached cart_frame! Stopping transform publishing.");
+      cart_transform_timer_->cancel();
+      cart_published_ = false; // Reset flag after reaching the goal
+      return;
+    }
+
+    // Otherwise, move the robot
+    geometry_msgs::msg::Twist cmd_vel;
+
+    // Set linear velocity proportional to distance
+    cmd_vel.linear.x = std::min(0.3, distance * 0.5);
+
+    // Set angular velocity proportional to the angle
+    cmd_vel.angular.z = std::min(1.0, angle_to_goal * 2.0);
+
+    velocity_pub_->publish(cmd_vel);
+  }
+
+  // Function to stop the robot
+  void stop_robot() {
+    geometry_msgs::msg::Twist stop_msg;
+    stop_msg.linear.x = 0.0;
+    stop_msg.angular.z = 0.0;
+    velocity_pub_->publish(stop_msg);
   }
 
   void lift_shelf() {
@@ -309,6 +381,7 @@ private:
 
   rclcpp::Service<custom_interfaces::srv::GoToLoading>::SharedPtr service_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
 
   rclcpp::TimerBase::SharedPtr scan_processing_timer_;
   rclcpp::TimerBase::SharedPtr cart_transform_timer_;
@@ -317,6 +390,16 @@ private:
 
   // Store the latest scan message
   sensor_msgs::msg::LaserScan::SharedPtr last_scan_;
+
+  // Publisher for velocity commands
+  rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr velocity_pub_;
+
+  // tf2 Buffer and Listener for transformations
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+
+  // Flag to track whether cart_frame has been published
+  bool cart_published_;
 
   // Variables to store detected leg information
   bool legs_detected_ = false;
