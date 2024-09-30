@@ -119,13 +119,12 @@ private:
 
     current_yaw_ = yaw;
 
-    // Log current yaw value
-    RCLCPP_INFO(this->get_logger(), "Current yaw: %f", current_yaw_);
-
     // If the robot is rotating, check if the target yaw has been reached
     if (rotating_) {
       // Normalize both current and target yaws
       current_yaw_ = normalize_angle(current_yaw_);
+      // Log current yaw value
+      RCLCPP_INFO(this->get_logger(), "Current yaw: %f", current_yaw_);
       double yaw_difference = normalize_angle(current_yaw_ - target_yaw_);
 
       RCLCPP_INFO(this->get_logger(), "Yaw Difference: %f", yaw_difference);
@@ -135,14 +134,8 @@ private:
                     "Target yaw reached. Stopping rotation.");
         stop_rotation();
         // Check if final_approach_ is true before calling the service
-        if (final_approach_) {
-          call_approach_service(); // Call the final approach service only if
-                                   // final_approach is true
-        } else {
-          RCLCPP_INFO(
-              this->get_logger(),
-              "Final approach skipped (final_approach parameter is false).");
-        }
+        call_approach_service(); // Call the final approach service only if
+                                 // final_approach is true
       } else {
         RCLCPP_INFO(this->get_logger(), "Rotating... Yaw difference: %f",
                     yaw_difference);

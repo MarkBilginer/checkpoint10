@@ -1,22 +1,46 @@
-#include "custom_interfaces/srv/go_to_loading.hpp"
-#include "geometry_msgs/msg/transform_stamped.hpp"
+// ROS2 core functionality for creating and managing nodes
 #include "rclcpp/rclcpp.hpp"
+
+// Custom service type for handling the approach to the shelf
+#include "custom_interfaces/srv/go_to_loading.hpp"
+
+// Message types for handling transformations and robot movement
+#include "geometry_msgs/msg/transform_stamped.hpp"
+#include "geometry_msgs/msg/twist.hpp"
+
+// Message types for subscribing to sensor and odometry data
+#include "nav_msgs/msg/odometry.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
+
+// tf2 libraries for handling transforms, broadcasting and listening to frames
+#include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_broadcaster.h"
-#include <cmath>
-#include <geometry_msgs/msg/twist.hpp>
-#include <iomanip> // for formatting
-#include <nav_msgs/msg/odometry.hpp>
+#include "tf2_ros/transform_listener.h"
+
+// tf2 libraries for geometry and quaternion operations
+#include <tf2/LinearMath/Matrix3x3.h>
+#include <tf2/LinearMath/Quaternion.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
-#include <tf2_ros/buffer.h>
-#include <tf2_ros/transform_listener.h>
-#include <unordered_map>
+
+// C++ standard libraries for common functionalities
+#include <cmath>   // For mathematical operations (sin, cos, etc.)
+#include <iomanip> // For formatted output
+#include <unordered_map> // For efficient data storage and lookup (scan data processing)
 
 using GoToLoading = custom_interfaces::srv::GoToLoading;
 
 class ApproachService : public rclcpp::Node {
 public:
   ApproachService() : Node("approach_service_server") {
+
+    // Initialize variables
+    moving_ = false;
+    cart_published_ = false;
+    lift_shelf_ = false;
+    shelf_lifted_ = false;
+    start_position_received_ = false;
+    distance_traveled_ = 0.0;
+    target_distance_ = 0.0;
 
     // Create the service
     service_ = this->create_service<GoToLoading>(
@@ -62,6 +86,11 @@ public:
     // Initially, stop the timer until the service is called
     cart_transform_timer_->cancel();
 
+    move_timer_ = this->create_wall_timer(
+        std::chrono::milliseconds(100), // Timer callback every 100 ms
+        std::bind(&ApproachService::move_timer_callback, this));
+    move_timer_->cancel();
+
     // Create a publisher for sending velocity commands
     velocity_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(
         "/diffbot_base_controller/cmd_vel_unstamped", 10);
@@ -79,6 +108,7 @@ private:
 
     const bool attach_to_shelf = request->attach_to_shelf;
     RCLCPP_INFO(this->get_logger(), "attach_to_shelf: %d", attach_to_shelf);
+    final_approach_ = attach_to_shelf;
     if (attach_to_shelf) {
       RCLCPP_INFO(this->get_logger(), "Performing final approach...");
       if (legs_detected_) {
@@ -98,7 +128,7 @@ private:
     } else {
       RCLCPP_INFO(this->get_logger(),
                   "Only publishing transform, no final approach.");
-      publish_cart_transform();
+      cart_transform_timer_->reset();
       response->complete = true;
     }
   }
@@ -120,12 +150,6 @@ private:
         0.6; // Expected distance between shelf legs in meters
     const double tolerance =
         0.15; // Allowable deviation from expected leg distance
-
-    // Print intensity values for each index
-    // for (size_t i = 0; i < last_scan_->intensities.size(); ++i) {
-    // RCLCPP_INFO(this->get_logger(), "Index: %lu, Intensity: %f", i,
-    //            last_scan_->intensities[i]);
-    //}
 
     // Create a map to store the count of each unique range value
     std::unordered_map<float, int> intensity_counts;
@@ -251,6 +275,7 @@ private:
       if (std::abs(distance_between_legs - expected_leg_distance) <=
           tolerance) {
         legs_detected_ = true;
+        // scan_processing_timer_->cancel();
 
         // Calculate the midpoint between the two legs
         double midpoint_x = (first_leg_x_avg + second_leg_x_avg) / 2.0;
@@ -318,53 +343,79 @@ private:
   }
 
   void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
-    if (!cart_published_) {
-      // If cart_frame hasn't been published, skip odom processing
-      return;
+
+    if (final_approach_) {
+
+      current_x_ = msg->pose.pose.position.x;
+      current_y_ = msg->pose.pose.position.y;
+
+      // Extract yaw (rotation around the z-axis) from the quaternion
+      tf2::Quaternion q(
+          msg->pose.pose.orientation.x, msg->pose.pose.orientation.y,
+          msg->pose.pose.orientation.z, msg->pose.pose.orientation.w);
+
+      tf2::Matrix3x3 m(q);
+      double roll, pitch, yaw;
+      m.getRPY(roll, pitch, yaw);
+
+      current_yaw_ = yaw; // Store the current yaw value
+
+      // Optionally, log the odom data if needed for debugging
+      RCLCPP_INFO(this->get_logger(), "Odom - X: %f, Y: %f, Yaw: %f",
+                  current_x_, current_y_, current_yaw_);
+
+      // Handle the case where the cart frame is being approached
+      if (cart_published_) {
+
+        // Move the robot towards the cart_frame using odom data
+        geometry_msgs::msg::TransformStamped transformStamped;
+
+        try {
+          // Get the transform from the robot base_link to cart_frame
+          transformStamped = tf_buffer_->lookupTransform(
+              "robot_base_link", "cart_frame", tf2::TimePointZero,
+              tf2::durationFromSec(0.2));
+        } catch (tf2::TransformException &ex) {
+          RCLCPP_WARN(this->get_logger(), "Could not transform: %s", ex.what());
+          return;
+        }
+
+        // Calculate the distance and angle to cart_frame
+        double dx = transformStamped.transform.translation.x;
+        double dy = transformStamped.transform.translation.y;
+        double distance = sqrt(dx * dx + dy * dy);
+        double angle_to_goal = atan2(dy, dx);
+
+        RCLCPP_INFO(this->get_logger(),
+                    "Distance to cart: %f, Angle to cart: %f", distance,
+                    angle_to_goal);
+
+        // Stop if the robot is close enough to the cart_frame
+        if (distance < 0.05) {
+          stop_robot();
+          RCLCPP_INFO(this->get_logger(),
+                      "Reached cart_frame! Stopping transform publishing.");
+          scan_processing_timer_->cancel();
+          cart_transform_timer_->cancel();
+
+          // Move the robot forward by 30 cm
+          move_forward_by_distance(0.3); // 0.3 meters = 30 cm
+
+          return;
+        }
+
+        // Otherwise, move the robot
+        geometry_msgs::msg::Twist cmd_vel;
+
+        // Set linear velocity proportional to distance
+        cmd_vel.linear.x = std::min(0.3, distance * 0.5);
+
+        // Set angular velocity proportional to the angle
+        cmd_vel.angular.z = std::min(1.0, angle_to_goal * 2.0);
+
+        velocity_pub_->publish(cmd_vel);
+      }
     }
-
-    // Move the robot towards the cart_frame using odom data
-    geometry_msgs::msg::TransformStamped transformStamped;
-
-    try {
-      // Get the transform from the robot base_link to cart_frame
-      transformStamped = tf_buffer_->lookupTransform(
-          "robot_base_link", "cart_frame", tf2::TimePointZero,
-          tf2::durationFromSec(0.2));
-    } catch (tf2::TransformException &ex) {
-      RCLCPP_WARN(this->get_logger(), "Could not transform: %s", ex.what());
-      return;
-    }
-
-    // Calculate the distance and angle to cart_frame
-    double dx = transformStamped.transform.translation.x;
-    double dy = transformStamped.transform.translation.y;
-    double distance = sqrt(dx * dx + dy * dy);
-    double angle_to_goal = atan2(dy, dx);
-
-    RCLCPP_INFO(this->get_logger(), "Distance to cart: %f, Angle to cart: %f",
-                distance, angle_to_goal);
-
-    // Stop if the robot is close enough to the cart_frame
-    if (distance < 0.05) {
-      stop_robot();
-      RCLCPP_INFO(this->get_logger(),
-                  "Reached cart_frame! Stopping transform publishing.");
-      cart_transform_timer_->cancel();
-      cart_published_ = false; // Reset flag after reaching the goal
-      return;
-    }
-
-    // Otherwise, move the robot
-    geometry_msgs::msg::Twist cmd_vel;
-
-    // Set linear velocity proportional to distance
-    cmd_vel.linear.x = std::min(0.3, distance * 0.5);
-
-    // Set angular velocity proportional to the angle
-    cmd_vel.angular.z = std::min(1.0, angle_to_goal * 2.0);
-
-    velocity_pub_->publish(cmd_vel);
   }
 
   // Function to stop the robot
@@ -373,10 +424,124 @@ private:
     stop_msg.linear.x = 0.0;
     stop_msg.angular.z = 0.0;
     velocity_pub_->publish(stop_msg);
+    moving_ = false;
+    RCLCPP_INFO(this->get_logger(), "Robot stopped.");
+    RCLCPP_INFO(this->get_logger(),
+                "Published stop command: linear.x = 0.0, angular.z = 0.0");
+  }
+
+  // Function to start moving the robot forward by a specified distance
+  void move_forward_by_distance(double distance) {
+    target_distance_ = distance;
+    distance_traveled_ = 0.0; // Reset the traveled distance
+    start_position_received_ =
+        false; // Flag to indicate when the first odometry is received
+
+    cart_published_ = false;
+    // Start moving the robot
+    moving_ = true;
+    move_timer_->reset(); // start the timer for moving robot 30cm
+
+    RCLCPP_INFO(this->get_logger(), "Starting to move forward for %f meters",
+                distance);
+  }
+
+  void move_timer_callback() {
+
+    if (moving_) {
+      if (!start_position_received_) {
+        // Capture the initial position once
+        start_x_ = current_x_;
+        start_y_ = current_y_;
+        start_yaw_ = current_yaw_; // Capture the initial yaw
+        start_position_received_ = true;
+        RCLCPP_INFO(this->get_logger(), "Start position and yaw received.");
+        return;
+      }
+
+      // Calculate the distance traveled from the starting position
+      double dx = current_x_ - start_x_;
+      double dy = current_y_ - start_y_;
+      distance_traveled_ = sqrt(dx * dx + dy * dy);
+
+      RCLCPP_INFO(this->get_logger(), "dx: %f meters", dx);
+      RCLCPP_INFO(this->get_logger(), "dy: %f meters", dy);
+
+      // RCLCPP_INFO(this->get_logger(),
+      //             "Distance traveled: %f meters,\n Target Distance: %f
+      //             meters", distance_traveled_, target_distance_);
+
+      // RCLCPP_INFO(this->get_logger(),
+      //            "Distance traveled dx: %f meters,\n Target Distance: %f
+      //           meters", dx, target_distance_);
+
+      // Stop the robot if it has traveled the desired distance
+      if (distance_traveled_ >= target_distance_) {
+        moving_ = false;
+        move_timer_
+            ->cancel(); // Cancel the timer after reaching the target distance
+
+        stop_robot();
+
+        RCLCPP_INFO(this->get_logger(), "Reached target distance of %f meters",
+                    target_distance_);
+
+        lift_shelf_ = true;
+        lift_shelf();
+
+        return;
+      }
+
+      // Calculate the yaw drift (difference between the current yaw and the
+      // starting yaw)
+      double yaw_error = current_yaw_ - start_yaw_;
+
+      // Normalize the yaw error to be within [-pi, pi]
+      yaw_error = atan2(sin(yaw_error), cos(yaw_error));
+
+      // Publish forward velocity command with yaw correction
+      geometry_msgs::msg::Twist cmd_vel;
+      cmd_vel.linear.x = 0.1; // Forward velocity
+      cmd_vel.angular.z =
+          -yaw_error * 2.5; // Correct yaw drift (adjust 0.5 to tune response)
+
+      velocity_pub_->publish(cmd_vel);
+      RCLCPP_INFO(this->get_logger(),
+                  "Continuing to move forward with yaw correction...");
+    }
   }
 
   void lift_shelf() {
-    RCLCPP_INFO(this->get_logger(), "You can now move the elevator up!");
+    // RCLCPP_INFO(this->get_logger(), "You can now move the elevator up!");
+    //  Check if the robot is positioned correctly underneath the shelf
+    if (!lift_shelf_) {
+      RCLCPP_WARN(this->get_logger(),
+                  "The robot is not underneath the shelf yet!");
+      return;
+    } else if (shelf_lifted_) {
+      RCLCPP_WARN(this->get_logger(), "The shelf is already lifted!");
+      return;
+    }
+
+    // Create an Empty message to publish
+    // std_msgs::msg::Empty empty_msg;
+
+    // Publish the Empty message to lift the elevator
+    // elevator_up_pub_->publish(empty_msg);
+
+    // RCLCPP_INFO(this->get_logger(), "Elevator is moving up to lift the
+    // shelf.");
+    // lift_shelf_ = false;
+    // shelf_lifted_ = true;
+
+    // Add a delay to allow time for the shelf to be lifted (optional, based on
+    // your setup)
+    // rclcpp::sleep_for(std::chrono::seconds(3));
+
+    // Cleanly shut down the ROS2 node after lifting the shelf
+    // RCLCPP_INFO(this->get_logger(), "Shelf lifted. Shutting down...");
+    RCLCPP_INFO(this->get_logger(), "You can now lift the shelf...");
+    rclcpp::shutdown();
   }
 
   rclcpp::Service<custom_interfaces::srv::GoToLoading>::SharedPtr service_;
@@ -385,6 +550,7 @@ private:
 
   rclcpp::TimerBase::SharedPtr scan_processing_timer_;
   rclcpp::TimerBase::SharedPtr cart_transform_timer_;
+  rclcpp::TimerBase::SharedPtr move_timer_;
 
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 
@@ -398,13 +564,29 @@ private:
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
-  // Flag to track whether cart_frame has been published
-  bool cart_published_;
-
   // Variables to store detected leg information
   bool legs_detected_ = false;
   double midpoint_angle_;
   double midpoint_distance_;
+
+  // Declare member variables here
+  bool moving_;
+  bool cart_published_;
+  bool final_approach_;
+  bool start_position_received_;
+  bool lift_shelf_;
+  bool shelf_lifted_;
+
+  double start_x_;
+  double start_y_;
+  double start_yaw_; // Yaw when the movement starts
+
+  double current_x_;
+  double current_y_;
+  double current_yaw_; // Current yaw from odometry
+
+  double distance_traveled_;
+  double target_distance_;
 };
 
 int main(int argc, char **argv) {
@@ -414,6 +596,7 @@ int main(int argc, char **argv) {
   // Use single-threaded executor (no callback groups)
   rclcpp::spin(node);
 
-  rclcpp::shutdown();
+  // No need to call rclcpp::shutdown() here since it's already called in
+  // lift_shelf()
   return 0;
 }
