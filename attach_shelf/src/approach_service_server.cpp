@@ -11,6 +11,8 @@
 // Message types for subscribing to sensor and odometry data
 #include "nav_msgs/msg/odometry.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
+#include "std_msgs/msg/empty.hpp" // Include Empty message type for /elevator_up
+#include "std_msgs/msg/string.hpp" // Include String message type for /elevator_up
 
 // tf2 libraries for handling transforms, broadcasting and listening to frames
 #include "tf2_ros/buffer.h"
@@ -57,6 +59,10 @@ public:
         "/scan", 10,
         std::bind(&ApproachService::scan_callback, this,
                   std::placeholders::_1));
+
+    // Create a publisher for /elevator_up
+    elevator_up_pub_ =
+        this->create_publisher<std_msgs::msg::String>("/elevator_up", 10);
 
     // Log the creation of the scan subscriber
     RCLCPP_INFO(this->get_logger(), "Subscriber for /scan topic created.");
@@ -391,7 +397,7 @@ private:
                     angle_to_goal);
 
         // Stop if the robot is close enough to the cart_frame
-        if (distance < 0.05) {
+        if (distance < 0.1) {
           stop_robot();
           RCLCPP_INFO(this->get_logger(),
                       "Reached cart_frame! Stopping transform publishing.");
@@ -399,20 +405,17 @@ private:
           cart_transform_timer_->cancel();
 
           // Move the robot forward by 30 cm
-          move_forward_by_distance(0.3); // 0.3 meters = 30 cm
+          move_forward_by_distance(0.5); // 0.3 meters = 30 cm
 
           return;
         }
 
-        // Otherwise, move the robot
+        // Create a Twist message for velocity commands
         geometry_msgs::msg::Twist cmd_vel;
 
         // Set linear velocity proportional to distance
         cmd_vel.linear.x = std::min(0.3, distance * 0.5);
-
-        // Set angular velocity proportional to the angle
-        cmd_vel.angular.z = std::min(1.0, angle_to_goal * 2.0);
-
+        cmd_vel.angular.z = 0.0;
         velocity_pub_->publish(cmd_vel);
       }
     }
@@ -502,8 +505,10 @@ private:
       // Publish forward velocity command with yaw correction
       geometry_msgs::msg::Twist cmd_vel;
       cmd_vel.linear.x = 0.1; // Forward velocity
-      cmd_vel.angular.z =
-          -yaw_error * 2.5; // Correct yaw drift (adjust 0.5 to tune response)
+      cmd_vel.angular.z = 0.0;
+      // cmd_vel.angular.z =
+      //   -yaw_error * 2.5; // Correct yaw drift (adjust 0.5 to tune
+      //   response)
 
       velocity_pub_->publish(cmd_vel);
       RCLCPP_INFO(this->get_logger(),
@@ -523,6 +528,13 @@ private:
       return;
     }
 
+    // Create and initialize a String message
+    std_msgs::msg::String msg;
+    msg.data = "lift_up"; // Same as the data you passed in the command line
+
+    // Publish the message
+    elevator_up_pub_->publish(msg);
+
     // Create an Empty message to publish
     // std_msgs::msg::Empty empty_msg;
 
@@ -534,19 +546,20 @@ private:
     // lift_shelf_ = false;
     // shelf_lifted_ = true;
 
-    // Add a delay to allow time for the shelf to be lifted (optional, based on
-    // your setup)
-    // rclcpp::sleep_for(std::chrono::seconds(3));
+    // Add a delay to allow time for the shelf to be lifted (optional, based
+    // on your setup) rclcpp::sleep_for(std::chrono::seconds(3));
 
     // Cleanly shut down the ROS2 node after lifting the shelf
     // RCLCPP_INFO(this->get_logger(), "Shelf lifted. Shutting down...");
-    RCLCPP_INFO(this->get_logger(), "You can now lift the shelf...");
+    RCLCPP_INFO(this->get_logger(), "The shelf has been lifted.");
     rclcpp::shutdown();
   }
 
   rclcpp::Service<custom_interfaces::srv::GoToLoading>::SharedPtr service_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr
+      elevator_up_pub_; // Publisher for /elevator_up
 
   rclcpp::TimerBase::SharedPtr scan_processing_timer_;
   rclcpp::TimerBase::SharedPtr cart_transform_timer_;

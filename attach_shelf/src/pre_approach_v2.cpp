@@ -145,6 +145,7 @@ private:
 
   void call_approach_service() {
     RCLCPP_INFO(this->get_logger(), "Calling approach service...");
+
     auto request = std::make_shared<GoToLoading::Request>();
     request->attach_to_shelf =
         final_approach_; // Use the final_approach_ parameter
@@ -156,16 +157,27 @@ private:
       RCLCPP_INFO(this->get_logger(), "Waiting for service /approach_shelf...");
     }
 
-    // Send the service request
-    auto result = final_approach_client_->async_send_request(request);
+    // Send the service request asynchronously
+    auto result_future = final_approach_client_->async_send_request(request);
 
-    // Handle the service response asynchronously
-    result.wait();
-    if (result.get()->complete) {
-      RCLCPP_INFO(this->get_logger(), "Final approach completed successfully.");
+    // Spin to wait for the future to complete
+    if (rclcpp::spin_until_future_complete(this->get_node_base_interface(),
+                                           result_future) ==
+        rclcpp::FutureReturnCode::SUCCESS) {
+      auto result = result_future.get();
+      if (result->complete) {
+        RCLCPP_INFO(this->get_logger(),
+                    "Final approach completed successfully.");
+      } else {
+        RCLCPP_ERROR(this->get_logger(), "Final approach failed.");
+      }
     } else {
-      RCLCPP_ERROR(this->get_logger(), "Final approach failed.");
+      RCLCPP_ERROR(this->get_logger(), "Service call failed.");
     }
+
+    // Shutdown the node after the service is complete
+    RCLCPP_INFO(this->get_logger(), "Shutting down PreApproachV2 node.");
+    rclcpp::shutdown(); // Shutdown the node
   }
 
   void stop_moving() {
