@@ -177,6 +177,8 @@ private:
     // Log stopping the rotation
     RCLCPP_INFO(this->get_logger(),
                 "Rotation complete. Robot stopped rotating.");
+
+    rclcpp::shutdown(); // This will gracefully shutdown the node
   }
 
   // Helper function to normalize angles to the range (-pi, pi)

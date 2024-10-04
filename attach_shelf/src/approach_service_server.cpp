@@ -16,6 +16,7 @@
 
 // tf2 libraries for handling transforms, broadcasting and listening to frames
 #include "tf2_ros/buffer.h"
+#include "tf2_ros/static_transform_broadcaster.h"
 #include "tf2_ros/transform_broadcaster.h"
 #include "tf2_ros/transform_listener.h"
 
@@ -77,6 +78,9 @@ public:
 
     // Set up the transform broadcaster
     tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
+    // Create the static transform broadcaster
+    static_tf_broadcaster_ =
+        std::make_shared<tf2_ros::StaticTransformBroadcaster>(this);
     RCLCPP_INFO(this->get_logger(), "Transform broadcaster initialized.");
 
     // Timer to process scan data every 500ms
@@ -87,7 +91,7 @@ public:
     // Timer to continuously publish the cart_frame transform
     cart_transform_timer_ = this->create_wall_timer(
         std::chrono::milliseconds(50), // Adjust the frequency as needed
-        std::bind(&ApproachService::publish_cart_transform, this));
+        std::bind(&ApproachService::publish_static_cart_transform, this));
 
     // Initially, stop the timer until the service is called
     cart_transform_timer_->cancel();
@@ -310,6 +314,50 @@ private:
     }
   }
 
+  void publish_static_cart_transform() {
+    if (!legs_detected_) {
+      RCLCPP_WARN(this->get_logger(),
+                  "Cannot publish static cart transform, legs not detected.");
+      return;
+    }
+
+    RCLCPP_INFO(this->get_logger(),
+                "Publishing static cart_frame transform...");
+
+    geometry_msgs::msg::TransformStamped static_transformStamped;
+
+    static_transformStamped.header.stamp = this->get_clock()->now();
+    static_transformStamped.header.frame_id =
+        "robot_front_laser_base_link";                     // Parent frame
+    static_transformStamped.child_frame_id = "cart_frame"; // Child frame
+
+    // Set the translation and rotation
+    static_transformStamped.transform.translation.x =
+        midpoint_distance_ * cos(midpoint_angle_);
+    static_transformStamped.transform.translation.y =
+        midpoint_distance_ * sin(midpoint_angle_);
+    static_transformStamped.transform.translation.z = 0.0;
+    
+    static_transformStamped.transform.rotation.x = 0.0;
+    static_transformStamped.transform.rotation.y = 0.0;
+    static_transformStamped.transform.rotation.z = 0.0;
+    static_transformStamped.transform.rotation.w = 1.0;
+
+    // Publish the static transform
+    static_tf_broadcaster_->sendTransform(static_transformStamped);
+
+    RCLCPP_INFO(this->get_logger(), "Static cart_frame transform published.");
+
+    cart_published_ = true; // Set flag to true when cart_frame is published
+                            // If final_approach is false, shutdown after
+                            // publishing the transform
+    if (!final_approach_) {
+      RCLCPP_INFO(this->get_logger(), "Cart frame published, final_approach is "
+                                      "false. Shutting down the node...");
+      rclcpp::shutdown(); // This will gracefully shutdown the node
+    }
+  }
+
   void publish_cart_transform() {
     if (!legs_detected_) {
       RCLCPP_WARN(this->get_logger(),
@@ -346,6 +394,13 @@ private:
                 midpoint_distance_ * sin(midpoint_angle_));
 
     cart_published_ = true; // Set flag to true when cart_frame is published
+                            // If final_approach is false, shutdown after
+                            // publishing the transform
+    if (!final_approach_) {
+      RCLCPP_INFO(this->get_logger(), "Cart frame published, final_approach is "
+                                      "false. Shutting down the node...");
+      rclcpp::shutdown(); // This will gracefully shutdown the node
+    }
   }
 
   void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
@@ -566,6 +621,7 @@ private:
   rclcpp::TimerBase::SharedPtr move_timer_;
 
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+  std::shared_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
 
   // Store the latest scan message
   sensor_msgs::msg::LaserScan::SharedPtr last_scan_;
