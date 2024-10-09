@@ -22,23 +22,44 @@ PreApproach::PreApproach(const rclcpp::NodeOptions &options)
       "/odom", 10,
       std::bind(&PreApproach::odom_callback, this, std::placeholders::_1));
 
+  // Create timers for processing
+  scan_processing_timer_ =
+      this->create_wall_timer(std::chrono::milliseconds(500),
+                              std::bind(&PreApproach::process_scan_data, this));
+
+  odom_processing_timer_ =
+      this->create_wall_timer(std::chrono::milliseconds(100),
+                              std::bind(&PreApproach::process_odom_data, this));
+  odom_processing_timer_->cancel();
+
   rotate_timer_ = this->create_wall_timer(
       std::chrono::milliseconds(100),
       std::bind(&PreApproach::rotate_robot_callback, this));
+  rotate_timer_->cancel();
 }
 
 void PreApproach::scan_callback(
     const sensor_msgs::msg::LaserScan::SharedPtr msg) {
+  // Just store the latest scan message without processing it
+  last_scan_ = msg;
+}
+
+void PreApproach::process_scan_data() {
+  if (!last_scan_) {
+    RCLCPP_WARN(this->get_logger(), "No scan data available yet.");
+    return;
+  }
+
   if (!rotation_complete_) {
-    int center_index =
-        msg->ranges.size() / 2; // Center corresponds to the robot's front
-    int range_window = 10;      // A small window around the front
+    int center_index = last_scan_->ranges.size() /
+                       2;  // Center corresponds to the robot's front
+    int range_window = 10; // A small window around the front
     bool obstacle_detected = false;
 
     // Check if any of the ranges in the front window detect an obstacle
     for (int i = center_index - range_window; i < center_index + range_window;
          ++i) {
-      if (msg->ranges[i] < obstacle_) {
+      if (last_scan_->ranges[i] < obstacle_) {
         obstacle_detected = true;
         break;
       }
@@ -63,9 +84,19 @@ void PreApproach::scan_callback(
 }
 
 void PreApproach::odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+  // Store the latest odometry message without processing it
+  last_odom_ = msg;
+}
+
+void PreApproach::process_odom_data() {
+  if (!last_odom_) {
+    RCLCPP_WARN(this->get_logger(), "No odometry data available yet.");
+    return;
+  }
   // Extract orientation quaternion from odom message
-  tf2::Quaternion q(msg->pose.pose.orientation.x, msg->pose.pose.orientation.y,
-                    msg->pose.pose.orientation.z, msg->pose.pose.orientation.w);
+  tf2::Quaternion q(
+      last_odom_->pose.pose.orientation.x, last_odom_->pose.pose.orientation.y,
+      last_odom_->pose.pose.orientation.z, last_odom_->pose.pose.orientation.w);
 
   // Convert quaternion to Euler angles
   tf2::Matrix3x3 m(q);
@@ -101,6 +132,8 @@ void PreApproach::stop_moving() {
   vel_pub_->publish(twist_msg);
 
   moving_forward_ = false;
+  scan_processing_timer_->cancel();
+  odom_processing_timer_->reset();
 
   // Log stopping
   RCLCPP_INFO(this->get_logger(), "Robot stopped moving.");
@@ -108,6 +141,7 @@ void PreApproach::stop_moving() {
 
 void PreApproach::start_rotation() {
   rotating_ = true;
+  rotate_timer_->reset();
   initial_yaw_ = current_yaw_; // Record the initial yaw
 
   // Convert degrees to radians and calculate the target yaw
@@ -138,13 +172,13 @@ void PreApproach::stop_rotation() {
   twist_msg.angular.z = 0.0;
   vel_pub_->publish(twist_msg);
 
+  odom_processing_timer_->cancel();
+  rotate_timer_->cancel();
   rotating_ = false;
   rotation_complete_ = true;
 
   // Log stopping the rotation
   RCLCPP_INFO(this->get_logger(), "Rotation complete. Robot stopped rotating.");
-
-  rclcpp::shutdown(); // This will gracefully shutdown the node
 }
 
 // Helper function to normalize angles to the range (-pi, pi)
